@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jan 17 10:54:53 2022
+Created on Tue Apr 19 13:27:11 2022
 
 @author: Stevo
 
-Contains functions for our model that are later invoked in the script for the execution
+We have an option for sequential and for parallel implementation.
 """
 
-
 import numpy as np
-
+from joblib import Parallel, delayed
+from CubicEquationSolver import single_cubic_one
 
 def quadratic_rig(C,deltas,bs1,keys1):
     ''' Computes a quadratic rig (approximation) given a weight vector C.
@@ -34,65 +34,106 @@ def objective_function(rig_mesh,target_mesh,lmbd,C):
     '''
     return np.linalg.norm(rig_mesh-target_mesh)**2 + lmbd*np.sum(C)
 
-def terms_and_coefficients(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,lmbd,bs1,keys1):
+def h_single_ctr(ctr,C,keys1,bs1,h):
+    indices1 = np.where(keys1[:,1]==ctr)[0]
+    indices2 = np.where(keys1[:,0]==ctr)[0]
+    h[:,ctr] += (C[keys1[indices1,0]]).dot(bs1[indices1])
+    h[:,ctr] += (C[keys1[indices2,1]]).dot(bs1[indices2])
+
+def coefficients_sequential(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,bs1,keys1,lmbd):
     ''' Computes coefficients for the upper bound polinomial to be minimized.
     Parametri:
-        target_mesh - vector; ground-truth mesh.
-                  C - vector of the controller activation weights.       
-          eig_max_D - vector; the largest eigenvalues for each D form D_sparse.
-          eig_min_D - vector; the smallest eigenvalues for each D form D_sparse.
-            sigma_D - vector; the largest singular values for each D from 
-                      D_sparse
-               lmbd - scalar; reglarization parameter.
-    '''
-    term_p = quadratic_rig(C,deltas,bs1,keys1) - target_mesh
-    coef0 = np.linalg.norm(term_p)**2 + lmbd*np.sum(C)
-    term_q = 0. + deltas
+     target_mesh - vector; ground-truth mesh.
+               C - vector of the controller activation weights.       
+       eig_max_D - vector; the largest eigenvalues for each D form D_sparse.
+       eig_min_D - vector; the smallest eigenvalues for each D form D_sparse.
+         sigma_D - vector; the largest singular values for each D from D_sparse.
+    '''   
+    g = np.dot(deltas, C) + np.dot(bs1.T,(C[keys1[:,0]]*C[keys1[:,1]])) - target_mesh
+    h = 0. + deltas
     for ctr in range(m):
-        indices1 = np.where(keys1[:,0]==ctr)
-        indices2 = keys1[indices1,1]
-        term_q[:,ctr] += (C[indices2].dot(bs1[indices1])/2)[0,:]
-    coef1 = 2*term_p.dot(term_q) + lmbd
-    term_r = np.zeros(n)
-    term_r[term_p>0] += eig_max_D[term_p>0]
-    term_r[term_p<0] += eig_min_D[term_p<0]
-    coef2 = 2*(np.sum(term_p*term_r) + np.sum(term_q**2))
+        h_single_ctr(ctr,C,keys1,bs1,h)
+    coef1 = 2*g.dot(h) + lmbd
+    coef2 = np.zeros(n)
+    coef2[g>0] += eig_max_D[g>0]
+    coef2[g<0] += eig_min_D[g<0]
+    coef2 = 2*(g.dot(coef2) + np.sum(h**2))
     coef4 = 2*m*np.sum(sigma_D**2)
-    return coef0,coef1,coef2,coef4
+    return coef1,coef2,coef4
 
-def compute_increment(C,m,coef0,coef1,coef2,coef4):
-    ''' It takes coefficients for the polinomial, and then visit one controller 
-    at a time, to find an increment that minimizes the upper bound.
+def coefficients_parallel(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,bs1,keys1,lmbd,n_jobs):
+    ''' Computes coefficients for the upper bound polinomial to be minimized.
+    Parametri:
+     target_mesh - vector; ground-truth mesh.
+               C - vector of the controller activation weights.       
+       eig_max_D - vector; the largest eigenvalues for each D form D_sparse.
+       eig_min_D - vector; the smallest eigenvalues for each D form D_sparse.
+         sigma_D - vector; the largest singular values for each D from D_sparse.
+          n_jobs - int; the maximum number of concurrently running jobs.
+    '''   
+    g = np.dot(deltas, C) + np.dot(bs1.T,(C[keys1[:,0]]*C[keys1[:,1]])) - target_mesh
+    h = 0. + deltas
+    Parallel(n_jobs=n_jobs,backend="threading")(
+              delayed(h_single_ctr)
+              (ctr,C,keys1,bs1,h)
+              for ctr in range(m))
+    coef1 = 2*g.dot(h) + lmbd
+    coef2 = np.zeros(n)
+    coef2[g>0] += eig_max_D[g>0]
+    coef2[g<0] += eig_min_D[g<0]
+    coef2 = 2*(g.dot(coef2) + np.sum(h**2))
+    coef4 = 2*m*np.sum(sigma_D**2)
+    return coef1,coef2,coef4
+
+def increment_single_ctr(ctr,C,coef1,coef2,coef4,increment):
+    # first check the borders
+    C_ctr, coef1_ctr = C[ctr], coef1[ctr]
+    root = 0. - C_ctr
+    root_value = coef1_ctr*root + coef2*(root**2) + coef4*(root**4)
+    root1 = 1 - C_ctr
+    root_value1 = coef1_ctr*root1 + coef2*(root1**2) + coef4*(root1**4)
+    if root_value1 < root_value:
+        root = root1
+        root_value = root_value1
+    # then extreme value(s)
+    root2 = single_cubic_one(4*coef4, 0, 2*coef2, coef1_ctr)
+    root_value2 = coef1_ctr*root2 + coef2*(root2**2) + coef4*(root2**4)
+    if root_value2 < root_value:
+        root = root2
+        root_value = root_value2                                          
+    increment[ctr] += root    
+    
+def increment_sequential(C,m,coef1,coef2,coef4):
+    ''' I take coefficients for the polinomial, and then visit one controller 
+    at a time, to find an increment that minimizes the upper bound - this is an
+    unconstrained minimization problem.
     Parameters:
-        coef0,coef1,coef2,coef4 - coefficients for the polinomial 
-                 obtained from the function 'terms_and_coefficients'. Scalars,
-                 except for the coef1, which is a vector.
+              coef1,coef2,coef4 - coefficients for the polinomial 
+                  obtained from the function 'terms_and_coefficients'. Scalars,
+                  except for the coef1, which is a vector.
     '''
     increment = np.zeros(m)
     for ctr in range(m):
-        min_x = -C[ctr] # check the borders (of the feasible set) first
-        min_y = coef4*(min_x**4) + coef2*(min_x**2) + coef1[ctr]*min_x + coef0
-        candidate_x = 1-C[ctr]
-        candidate_y = coef4*(candidate_x**4) + coef2*(candidate_x**2) + coef1[ctr]*candidate_x + coef0
-        if candidate_y < min_y:
-            min_y = candidate_y
-            min_x = candidate_x
-        # then we check potential extreme values.
-        # If it is within the feasible set (-C, 1-C), I check if the value is lower than at the border.
-        # Use a closed form solution
-        term0 = 27*((4*coef4)**2)*coef1[ctr]
-        term1 = (term0)**2 - 4*((-3*(4*coef4)*(2*coef2))**3)
-        if term1 >= 0: # if this is negative, a root is complex, so we dismiss it 
-            candidate_x = -1/(3*(4*coef4))*np.cbrt(.5*(term0+np.sqrt(term1))) - 1/(3*(4*coef4))*np.cbrt(.5*(term0-np.sqrt(term1)))
-            if candidate_x > -C[ctr] and candidate_x < 1-C[ctr]:
-                candidate_y = coef4*(candidate_x**4) + coef2*(candidate_x**2) + coef1[ctr]*candidate_x + coef0
-                if candidate_y < min_y:
-                    min_y = candidate_y
-                    min_x = candidate_x               
-        increment[ctr] += min_x
+        increment_single_ctr(ctr,C,coef1,coef2,coef4,increment)
     return increment
 
-def minimization(num_iter,C,deltas,target_mesh,eig_max_D,eig_min_D,sigma_D,n,m,tolerance,lmbd,bs1,keys1,return_residuals=False):
+def increment_parallel(C,m,coef1,coef2,coef4,n_jobs):
+    ''' I take coefficients for the polinomial, and then visit one controller 
+    at a time, to find an increment that minimizes the upper bound - this is an
+    unconstrained minimization problem.
+    Parameters:
+              coef1,coef2,coef4 - coefficients for the polinomial 
+                  obtained from the function 'terms_and_coefficients'. Scalars,
+                  except for the coef1, which is a vector.
+    '''
+    increment = np.zeros(m)
+    Parallel(n_jobs=n_jobs,backend="threading")(
+              delayed(increment_single_ctr)
+              (ctr,C,coef1,coef2,coef4,increment)
+              for ctr in range(m))
+    return increment
+
+def minimization(num_iter,C,deltas,target_mesh,eig_max_D,eig_min_D,sigma_D,n,m,tolerance,lmbd,bs1,keys1):
     ''' We use previously define functions to minimize the upper bound function.
     In each iteration we collect the values of the objective and the bound 
     function. Algorithm terminates if we exceed maximum number of iterations or
@@ -116,39 +157,54 @@ def minimization(num_iter,C,deltas,target_mesh,eig_max_D,eig_min_D,sigma_D,n,m,t
                       order; corrective meshes 
               keys1 - m1*2 matrix; tuples of indices that invoke any of the 
                       corrective meshes from bs1
-   return_residuals - boolean; specifies if the function will additionally 
-                      return the values of the objective (and the bound) for
-                      each iteration. Deafult False.
     '''
-    if return_residuals==False:
-        bound_values = []
-        for i in range(num_iter):
-            coef0,coef1,coef2,coef4 = terms_and_coefficients(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,lmbd,bs1,keys1)
-            increment = compute_increment(C,m,coef0,coef1,coef2,coef4)        
-            bound_val = coef0 + coef1.dot(increment) + coef2*(np.linalg.norm(increment)**2) + coef4*(np.sum(increment**4))
-            bound_values.append(bound_val)
-            C += increment
-            if i>1 and (np.abs(bound_values[-1]-bound_values[-2])<tolerance):
-                break
-        return C, i
-    # this is the case when we want also to return the values of the objective function and the bound for each iteration:
-    else:
-        bound_values, objective_values = [],[]
-        fidelity = [np.linalg.norm(deltas.dot(C) + bs1.T.dot(C[keys1[:,0]]*C[keys1[:,1]])-target_mesh)**2]
-        regularization = [np.sum(C)]
-        for i in range(num_iter):
-            coef0,coef1,coef2,coef4 = terms_and_coefficients(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,lmbd,bs1,keys1)
-            increment = compute_increment(C,m,coef0,coef1,coef2,coef4)        
-            bound_val = coef0 + coef1.dot(increment) + coef2*(np.linalg.norm(increment)**2) + coef4*(np.sum(increment**4))
-            bound_values.append(bound_val)
-            C += increment
-            rig_mesh = quadratic_rig(C,deltas,bs1,keys1)
-            objective_val = objective_function(rig_mesh,target_mesh,lmbd,C)
-            objective_values.append(objective_val)
-            fidelity.append(np.linalg.norm(rig_mesh-target_mesh)**2)
-            regularization.append(np.sum(C))
-            if i>1 and (np.abs(bound_values[-1]-bound_values[-2])<tolerance):
-                break
-        return C, bound_values, objective_values, fidelity, regularization
+    bound_values = []
+    for i in range(num_iter):
+        coef1,coef2,coef4 = coefficients_sequential(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,bs1,keys1,lmbd)
+        increment = increment_sequential(C,m,coef1,coef2,coef4)        
+        bound_val = coef1.dot(increment) + coef2*(np.linalg.norm(increment)**2) + coef4*(np.sum(increment**4))
+        bound_values.append(bound_val)
+        C += increment
+        if i>1 and (np.abs(bound_values[-1]-bound_values[-2])<tolerance):
+            break
+    return C, i
+
+def minimization_parallel(num_iter,C,deltas,target_mesh,eig_max_D,eig_min_D,sigma_D,n,m,tolerance,lmbd,bs1,keys1,n_jobs):
+    ''' We use previously define functions to minimize the upper bound function.
+    In each iteration we collect the values of the objective and the bound 
+    function. Algorithm terminates if we exceed maximum number of iterations or
+    the change in objective is under some predefined tolerance threshold.
+    Parameters:
+           num_iter - integer; number of iterations before we terminate the 
+                      algorithm.
+                  C - vector of the controller activation weights.
+             deltas - nxm matrix; delta offset values.
+        target_mesh - vector; ground-truth mesh.
+          eig_max_D - vector; the largest eigenvalues for each D form D_sparse.
+          eig_min_D - vector; the smallest eigenvalues for each D form D_sparse.
+            sigma_D - vector; the largest sing. values for each D form D_sparse.
+                  n - scalar; number of coordinates in the face.
+                  m - scalar; number of controllers for the model.
+          tolerance - scalar; threshold value. If objective cost or the value 
+                      of the upper bound between two consecutive values change 
+                      less than tolerance, we terminate the algorithm.
+               lmbd - scalar; reglarization parameter.
+                bs1 - m1xn matrix, where m1 is number of rig corrections of first 
+                      order; corrective meshes 
+              keys1 - m1*2 matrix; tuples of indices that invoke any of the 
+                      corrective meshes from bs1
+             n_jobs - int; the maximum number of concurrently running jobs.
+    '''
+    bound_values = []
+    for i in range(num_iter):
+        coef1,coef2,coef4 = coefficients_parallel(target_mesh,C,n,m,eig_max_D,eig_min_D,sigma_D,deltas,bs1,keys1,lmbd,n_jobs)
+        increment = increment_parallel(C,m,coef1,coef2,coef4,n_jobs)        
+        bound_val = coef1.dot(increment) + coef2*(np.linalg.norm(increment)**2) + coef4*(np.sum(increment**4))
+        bound_values.append(bound_val)
+        C += increment
+        if i>1 and (np.abs(bound_values[-1]-bound_values[-2])<tolerance):
+            break
+    return C, i
+
     
     
